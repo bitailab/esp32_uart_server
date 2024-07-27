@@ -3,7 +3,19 @@
 
 # ESP32_UART_SERVER
 
-这是一个串口服务器，基于 UART_ECHO 和 wifi_managed 开源项目修改得到，目前是个初级版本。它支持Web 的方式进行配网。
+这是一个串口服务器，UART转 TCP。参考官方 UART_ECHO demo和 开源项目wifi_manager ，目前是个初级版本，还未严格测试过。
+特性：
+1. 支持Web 的方式进行配网(Captive Portal)。
+2. 透明转发 tcp<->uart，用异步的方式进行收发。
+3. TODO：支持Web 的方式进行服务端配置，包括串口波特率、串口号、TCP server 相关
 
-## 相关配置
-代码在 ESP32-WROOM-32 的模组测试通过，实际使用中要注意 UART 和引脚的选择，在代码中进行修改。
+
+## 使用说明
+1. 运行后，生成一个名叫“esp32”的 WIFI 热点，用手机连接，初始密码是：esp32pwd，配置项在 components/esp32-wifi-manager/Kconfig 中。
+2. 连接“esp32”热点，会弹出配置页面，按页面选择要配置的 WIFI 和密码后，完成配网。
+![wifi connected and tcp listening](./images/wifi_connected_tcp_listening.png)
+3. 查看步骤 2 中串口打印的 esp32 IP地址(上图中是192.168.31.179)，用客户端连接即可
+
+## 配置
+1. 代码在 ESP32-WROOM-32 的模组能运行，因为相关设备未到，还未严格测试过。
+2. 在其它模组中使用时，要注意 UART port和IO口的选择
