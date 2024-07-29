@@ -59,19 +59,60 @@
 static QueueHandle_t s_tcp2uart_queue = NULL;
 static QueueHandle_t s_uart2tcp_queue = NULL;
 
-static const char *TAG = "UART TEST";
+static const char *TAG = "UART SERVER";
 
 #define BUF_SIZE (1024 * 2)
 #define UART2TCP_QUEUE_LEN (100)
 #define TCP2UART_QUEUE_LEN (100)
+
+
+#define TCP_SERVER_TASK_PRIORITY (10)
+#define UART_WRITE_TASK_PRIORITY (5)
+#define UART_READ_TASK_PRIORITY (5)
+#define TCP_CLIENT_SEND_TASK_PRIORITY (4)
+#define TCP_CLIENT_RECV_TASK_PRIORITY (4)
 
 typedef struct {
     char* data;
     int len;
 } tcp_uart_data_t;
 
-esp_err_t send_uart2tcp_queue(tcp_uart_data_t *d);
-esp_err_t send_tcp2uart_queue(tcp_uart_data_t *d);
+enum UART_SERVER_SOCK_STAT {
+    UART_SERVER_SOCK_STAT_OK = 0,
+    UART_SERVER_SOCK_STAT_ERROR = -1
+};
+
+static int connected_flag = 0;
+static SemaphoreHandle_t xMutex = NULL;
+static int set_connected_flag() {
+    if (xSemaphoreTake(xMutex, portMAX_DELAY) != pdTRUE) {
+        return -1;
+    }
+    connected_flag = 1;
+    xSemaphoreGive(xMutex);
+    return 0;
+}
+
+static int clear_connected_flag() {
+    if (xSemaphoreTake(xMutex, portMAX_DELAY) != pdTRUE) {
+        return -1;
+    }
+    connected_flag = 0;
+    xSemaphoreGive(xMutex);
+    return 0;
+}
+
+static int get_connected_flag(int *res) {
+    if (xSemaphoreTake(xMutex, 10/portTICK_PERIOD_MS) != pdTRUE) {
+        return -1;
+    }
+    *res = connected_flag;
+    xSemaphoreGive(xMutex);
+    return 0;
+}
+
+static esp_err_t send_uart2tcp_queue(tcp_uart_data_t *d);
+static esp_err_t send_tcp2uart_queue(tcp_uart_data_t *d);
 
 static esp_err_t uart_init(void)
 {
@@ -103,11 +144,11 @@ static void uart_write_task(void)
     tcp_uart_data_t d;
 
     while (1) {
-        if(xQueueReceive(s_tcp2uart_queue, &d, 1000/portTICK_PERIOD_MS) == pdTRUE) {
+        if(xQueueReceive(s_tcp2uart_queue, &d, 10/portTICK_PERIOD_MS) == pdTRUE) {
             uart_write_bytes(ECHO_UART_PORT_NUM, (const char *) d.data, d.len);
             if (d.len) {
-                d.data[d.len] = '\0';
-                ESP_LOGI(TAG, "write to uart: %s", (char *) d.data);
+                ESP_LOGI(TAG, "Writed %d bytes to UART", d.len);
+                //ESP_LOG_BUFFER_HEX(TAG, d.data, d.len);
             }
             free(d.data);
         }
@@ -122,9 +163,9 @@ static void uart_read_task(void)
     uint8_t *data = (uint8_t *) malloc(BUF_SIZE);
     while(1) {
         // Read data from the UART
-        int len = uart_read_bytes(ECHO_UART_PORT_NUM, data, (BUF_SIZE - 1), 1000 / portTICK_PERIOD_MS);
+        int len = uart_read_bytes(ECHO_UART_PORT_NUM, data, (BUF_SIZE - 1), 10 / portTICK_PERIOD_MS);
         if (len) {
-            ESP_LOGI(TAG, "received data from uart, len = %d", len);
+            ESP_LOGI(TAG, "Received data from uart, len = %d", len);
             tcp_uart_data_t d;
             // Configure a temporary buffer for the incoming data
             d.data = (char *) malloc(len+1);
@@ -139,7 +180,7 @@ static void uart_read_task(void)
     vTaskDelete(NULL);//删除整个task，不然会触发看门狗
 }
 
-esp_err_t send_tcp2uart_queue(tcp_uart_data_t *d) {
+static esp_err_t send_tcp2uart_queue(tcp_uart_data_t *d) {
     if(xQueueSend(s_tcp2uart_queue, d, 0) != pdTRUE) {
         ESP_LOGE(TAG, "failed to send tcp data to uart queue");
         return ESP_FAIL;
@@ -165,7 +206,7 @@ static int try_receive(const char *tag, const int sock, char * data, size_t max_
     return len;
 }
 
-int readable_timeo(int fd, int sec) {
+static int readable_timeo(int fd, int sec) {
     fd_set rset;
     struct timeval tv;
     FD_ZERO(&rset);
@@ -176,20 +217,19 @@ int readable_timeo(int fd, int sec) {
     return (select(fd+1, &rset, NULL, NULL, &tv));
 }
 
-int get_socket_stat(int sock) {
+static int get_socket_stat(int sock) {
     int error;
     socklen_t error_len = sizeof(error);
     if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &error_len) == 0) {
         if (error != 0) {
-            return -1;
+            return UART_SERVER_SOCK_STAT_ERROR;
         }
-    } else {
-        return -2;
-    }
-    return 0;
+        return UART_SERVER_SOCK_STAT_OK;
+    } 
+    return UART_SERVER_SOCK_STAT_ERROR;
 }
 
-void handle_client_send_task(void *pt){
+static void handle_client_send_task(void *pt){
     int len;
     char rx_buffer[BUF_SIZE];//接收TCP的数据
     int sock = (int)pt;//创建任务传过来的参数（sock句柄）
@@ -198,11 +238,11 @@ void handle_client_send_task(void *pt){
     ESP_LOGI(TAG, "tcp sending task loop start");
     while (1)
     {
-        if (get_socket_stat(sock) != 0) {
+        if (get_socket_stat(sock) != UART_SERVER_SOCK_STAT_OK) {
             goto CLEAN_UP;
         }
         // 读UART QUEUE
-        if(xQueueReceive(s_uart2tcp_queue, &uart2tcp_data, 100/portTICK_PERIOD_MS)) {
+        if(xQueueReceive(s_uart2tcp_queue, &uart2tcp_data, 10/portTICK_PERIOD_MS)) {
             int to_write = uart2tcp_data.len;
             ESP_LOGI(TAG, "Sending data from uart to tcp, bytes: %d", to_write);
             while(to_write > 0) {
@@ -219,6 +259,8 @@ void handle_client_send_task(void *pt){
             if(connecttag) {
                 goto CLEAN_UP;
             }
+        } else {
+            taskYIELD();
         }
     }
 
@@ -229,7 +271,7 @@ CLEAN_UP:
     vTaskDelete(NULL);//删除整个task，不然会触发看门狗
 }
 
-void handle_client_recv_task(void *pt){
+static void handle_client_recv_task(void *pt){
     int len;
     char rx_buffer[BUF_SIZE];//接收TCP的数据
     int sock = (int)pt;//创建任务传过来的参数（sock句柄）
@@ -244,30 +286,32 @@ void handle_client_recv_task(void *pt){
             continue;
         }
         //  读TCP
-        len = try_receive(TAG, sock, rx_buffer, sizeof(rx_buffer) - 1);
+        len = try_receive(TAG, sock, rx_buffer, sizeof(rx_buffer));
         if (len < 0) {
             goto CLEAN_UP;
         } else if (len > 0) {
-            rx_buffer[len] = 0; // Null-terminate whatever is received and treat it like a string将接收到的任何内容终止为空，并将其视为字符串
-            ESP_LOGI(TAG, " Received %d bytes: %s", len, rx_buffer);
+            ESP_LOGI(TAG, "Received %d bytes", len);
             tcp_uart_data_t tcp2uart_data;
             tcp2uart_data.data = (char*) malloc(len);
             if(tcp2uart_data.data == NULL) {
                 ESP_LOGE(TAG, "malloc error");
                 continue;
             }
+            memset(tcp2uart_data.data, 0, len);
             tcp2uart_data.len = len;
             memcpy(tcp2uart_data.data, rx_buffer, len);
             send_tcp2uart_queue(&tcp2uart_data);
         } else {
-            ESP_LOGI(TAG, "vtaskDelay");
-            vTaskDelay(1/portTICK_PERIOD_MS);
+            taskYIELD();
         }
     }
 
 CLEAN_UP:
     shutdown(sock, 0);
     close(sock);
+    if(clear_connected_flag()<0) {
+        ESP_LOGE(TAG, "sock: %d, clear connected flag failed", sock);
+    }
     ESP_LOGI(TAG, "sock: %d closed, exit receiving task", sock);
     vTaskDelete(NULL);//删除整个task，不然会触发看门狗
 }
@@ -281,6 +325,7 @@ static void tcp_server_task(void *pvParameters)
     int keepIdle = KEEPALIVE_IDLE;
     int keepInterval = KEEPALIVE_INTERVAL;
     int keepCount = KEEPALIVE_COUNT;
+    int is_connected = -1;
     struct sockaddr_storage dest_addr;
 
     if (addr_family == AF_INET) {
@@ -340,6 +385,15 @@ static void tcp_server_task(void *pvParameters)
                 break;
             }
         }
+        if(get_connected_flag(&is_connected) < 0 || 
+                (get_connected_flag(&is_connected) == 0 && is_connected)) {
+            ESP_LOGE(TAG, "Max client connected. Rejecting new client.");
+            close(sock);
+            continue;
+        }
+
+        // Set connected flag
+        set_connected_flag();
 
         // Set tcp keepalive option
         setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(int));
@@ -363,8 +417,10 @@ static void tcp_server_task(void *pvParameters)
 
         //shutdown(sock, 0);
         //close(sock);
-        xTaskCreate(handle_client_recv_task, "handle_client_recv_task", 4096, (void *)sock, 5, NULL);
-        xTaskCreate(handle_client_send_task, "handle_client_send_task", 4096, (void *)sock, 5, NULL);
+        xTaskCreate(handle_client_recv_task, "handle_client_recv_task", 4096, 
+                        (void *)sock, TCP_CLIENT_RECV_TASK_PRIORITY, NULL);
+        xTaskCreate(handle_client_send_task, "handle_client_send_task", 4096, 
+                        (void *)sock, TCP_CLIENT_SEND_TASK_PRIORITY, NULL);
     }
 
 CLEAN_UP:
@@ -373,13 +429,12 @@ CLEAN_UP:
 }
 
 
-esp_err_t send_uart2tcp_queue(tcp_uart_data_t *d)
+static esp_err_t send_uart2tcp_queue(tcp_uart_data_t *d)
 {
     if(xQueueSend(s_uart2tcp_queue, d, 0) != pdTRUE) {
         ESP_LOGE(TAG, "failed to send to uart2tcp queue");
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "sending uart to tcp queue, done");
     return ESP_OK;
 }
 
@@ -395,11 +450,13 @@ void cb_connection_ok(void *pvParameter){
 	esp_ip4addr_ntoa(&param->ip_info.ip, str_ip, IP4ADDR_STRLEN_MAX);
 
 	ESP_LOGI(TAG, "I have a connection and my IP is %s!", str_ip);
-    xTaskCreate(tcp_server_task, "tcp_server", 4096, (void*)AF_INET, 5, NULL);
-    xTaskCreate(uart_write_task, "uart_write_task", ECHO_TASK_STACK_SIZE, NULL, 10, NULL);
-    xTaskCreate(uart_read_task, "uart_read_task", ECHO_TASK_STACK_SIZE, NULL, 10, NULL);
+    xTaskCreate(tcp_server_task, "tcp_server", 4096, (void*)AF_INET, 
+                    TCP_SERVER_TASK_PRIORITY, NULL);
+    xTaskCreate(uart_write_task, "uart_write_task", ECHO_TASK_STACK_SIZE, NULL, 
+                    UART_WRITE_TASK_PRIORITY, NULL);
+    xTaskCreate(uart_read_task, "uart_read_task", ECHO_TASK_STACK_SIZE, NULL,
+                    UART_READ_TASK_PRIORITY, NULL);
 }
-
 void app_main(void)
 {
     //ESP_ERROR_CHECK(nvs_flash_init());
@@ -418,6 +475,15 @@ void app_main(void)
 	wifi_manager_start();
     /* register a callback as an example to how you can integrate your code with the wifi manager */
 	wifi_manager_set_callback(WM_EVENT_STA_GOT_IP, &cb_connection_ok);
+
+    // 创建互斥量
+    xMutex = xSemaphoreCreateMutex();
+    if (xMutex == NULL) {
+        // 互斥量创建失败
+        ESP_LOGE(TAG, "Create mutex failed");
+        abort();
+    }
+
 
     s_uart2tcp_queue = xQueueCreate(UART2TCP_QUEUE_LEN, sizeof(tcp_uart_data_t));
     if (!s_uart2tcp_queue) {
